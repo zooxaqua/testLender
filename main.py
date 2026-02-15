@@ -30,11 +30,14 @@ def _now() -> float:
     return time.time()
 
 
-def _is_cache_fresh(source: str) -> bool:
+def _is_cache_fresh(source: str, limit: int) -> bool:
     entry = _cache.get(source)
     if not entry:
         return False
-    return _now() - entry["fetched_at"] < CACHE_TTL_SECONDS
+    if _now() - entry["fetched_at"] >= CACHE_TTL_SECONDS:
+        return False
+    items = entry.get("items", [])
+    return len(items) >= limit
 
 
 def _clamp_limit(limit: int) -> int:
@@ -129,13 +132,14 @@ async def _fetch_news(source: str, limit: int) -> list[dict[str, Any]]:
 
 async def _refresh_cache(source: str, limit: int) -> list[dict[str, Any]]:
     async with _cache_lock:
-        if _is_cache_fresh(source):
+        if _is_cache_fresh(source, limit):
             return _cache[source]["items"]
 
         items = await _fetch_news(source, limit)
         _cache[source] = {
             "items": items,
             "fetched_at": _now(),
+            "limit": limit,
         }
         return items
 
@@ -165,10 +169,10 @@ async def get_news(
     limit = _clamp_limit(limit)
     cached_items = _get_cached_items(source)
 
-    if cached_items and _is_cache_fresh(source):
+    if cached_items and _is_cache_fresh(source, limit):
         return JSONResponse(cached_items[:limit])
 
-    if cached_items:
+    if cached_items and len(cached_items) >= limit:
         background_tasks.add_task(_refresh_cache, source, limit)
         return JSONResponse(cached_items[:limit])
 
