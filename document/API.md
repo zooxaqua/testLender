@@ -170,20 +170,6 @@ curl http://localhost:8000/api/sources
 
 #### `GET /health`
 
-**エラーレスポンス**:
-
-パラメータが不正な場合でも、自動補正されて正常なレスポンスが返されます：
-
-- `source`が不正な値の場合 → `mixed`として処理
-- `limit`が1未満の場合 → `1`として処理
-- `limit`が50を超える場合 → `50`として処理
-
----
-
-### 3. ヘルスチェック
-
-#### `GET /health`
-
 サーバーの稼働状態を確認します。
 
 **リクエスト例**:
@@ -193,11 +179,33 @@ curl http://localhost:8000/health
 
 **レスポンス**:
 
+- Content-Type: `application/json`
+- ステータスコード: `200 OK`
+
 ```json
 {
   "status": "ok"
 }
 ```
+
+**使用例**:
+- デプロイ先でのヘルスチェック
+- モニタリングツールからの死活監視
+- ロードバランサーのヘルスチェック
+
+---
+
+## パラメータ検証
+
+### エラーレスポンス
+
+パラメータが不正な場合でも、自動補正されて正常なレスポンスが返されます：
+
+- `sources`に無効な値が含まれる場合 → 有効なソースのみ使用、無効な場合は`yahoo`にフォールバック
+- `limit`が1未満の場合 → `1`として処理
+- `limit`が50を超える場合 → `50`として処理
+- `sort_by`が不正な値の場合 → `published_at`として処理
+- `sort_order`が不正な値の場合 → `desc`として処理
 
 - Content-Type: `application/json`
 - ステータスコード: `200 OK`
@@ -213,15 +221,19 @@ curl http://localhost:8000/health
 
 ### キャッシュキー
 
-キャッシュは`source`パラメータごとに管理されます：
-- `rss`
-- `scrape`
-- `mixed`
+キャッシュは以下のパラメータの組み合わせで管理されます：
+- `sources`: ソースの組み合わせ（例: `yahoo,nhk`, `all`, `google`）
+- `limit`: 取得件数
+- `sort_by`: ソート基準
+- `sort_order`: ソート順序
+- `keyword`: 検索キーワード（指定されている場合）
+
+キャッシュキーの例: `nhk,yahoo:20:published_at:desc:技術`
 
 ### キャッシュのTTL
 
 - **有効期限**: 300秒（5分）
-- 設定場所: `backend/main.py`の`CACHE_TTL_SECONDS`
+- 設定場所: `backend/config.py`の`CACHE_TTL_SECONDS`
 
 ### キャッシュの動作
 
@@ -248,8 +260,9 @@ curl http://localhost:8000/health
 現在、APIレベルでのレート制限は実装されていません。
 
 ただし、キャッシュ機構により以下の制限があります：
-- 同じ`source`への連続リクエストは5分間キャッシュから返される
-- Yahoo Newsへの実際のアクセスは最短で5分に1回
+- 同じパラメータの組み合わせへの連続リクエストは5分間キャッシュから返される
+- 各ニュースソースへの実際のアクセスは最短で5分に1回
+- 複数のソースを組み合わせることで、より多くの記事を取得可能
 
 ---
 
@@ -257,12 +270,25 @@ curl http://localhost:8000/health
 
 ### 外部APIエラー
 
-Yahoo Newsへのアクセスに失敗した場合：
+ニュースソースへのアクセスに失敗した場合：
 
 - ネットワークタイムアウト（10秒）
 - HTTPエラー（4xx, 5xx）
 
-これらのエラーは内部で処理され、クライアントには空の配列が返されます：
+これらのエラーは各アダプター内で処理され、失敗したソースのデータは空として扱われます。
+他のソースが成功していれば、それらのデータは正常に返されます：
+
+```json
+[
+  {
+    "title": "成功したソースからのニュース",
+    "url": "https://example.com/news",
+    ...
+  }
+]
+```
+
+全てのソースが失敗した場合は、空の配列が返されます：
 
 ```json
 []
@@ -285,13 +311,14 @@ Yahoo Newsへのアクセスに失敗した場合：
 ### レスポンスタイム
 
 - **キャッシュヒット時**: < 10ms
-- **キャッシュミス時**: 200-2000ms（Yahoo Newsのレスポンス時間に依存）
+- **キャッシュミス時**: 200-2000ms（各ニュースソースのレスポンス時間に依存）
+- **複数ソース取得時**: 並行処理により、最も遅いソースのレスポンス時間に依存
 
 ### 同時リクエスト
 
 - FastAPIとuvicornは非同期処理をサポート
 - 複数の同時リクエストを効率的に処理可能
-- キャッシュロックにより、同じソースへの並行アクセスを制御
+- キャッシュロックにより、同じパラメータへの並行アクセスを制御
 
 ---
 
@@ -315,11 +342,13 @@ app.add_middleware(
 
 ### User-Agent
 
-Yahoo Newsへのリクエストには以下のUser-Agentが設定されています：
+各ニュースソースへのリクエストには以下のUser-Agentが設定されています：
 
 ```
 Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
 ```
+
+設定場所: `backend/config.py`の`USER_AGENT`
 
 ---
 
@@ -329,14 +358,24 @@ Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
 
 ```javascript
 // ニュースを取得
-async function fetchNews(source = 'mixed', limit = 12) {
-  const response = await fetch(`/api/news?source=${source}&limit=${limit}`);
+async function fetchNews(sources = 'all', limit = 20, keyword = '') {
+  let url = `/api/news?sources=${sources}&limit=${limit}`;
+  if (keyword) {
+    url += `&keyword=${encodeURIComponent(keyword)}`;
+  }
+  const response = await fetch(url);
   const news = await response.json();
   return news;
 }
 
 // 使用例
-fetchNews('rss', 20)
+// 全ソースから20件取得
+fetchNews('all', 20)
+  .then(news => console.log(news))
+  .catch(error => console.error('Error:', error));
+
+// Yahoo + NHKから「技術」というキーワードで検索
+fetchNews('yahoo,nhk', 30, '技術')
   .then(news => console.log(news))
   .catch(error => console.error('Error:', error));
 ```
@@ -347,27 +386,38 @@ fetchNews('rss', 20)
 import httpx
 import asyncio
 
-async def get_news(source='mixed', limit=12):
+async def get_news(sources='all', limit=20, keyword=None):
     async with httpx.AsyncClient() as client:
+        params = {'sources': sources, 'limit': limit}
+        if keyword:
+            params['keyword'] = keyword
         response = await client.get(
             'http://localhost:8000/api/news',
-            params={'source': source, 'limit': limit}
+            params=params
         )
         return response.json()
 
 # 使用例
-news = asyncio.run(get_news('rss', 20))
+# 全ソースから20件取得
+news = asyncio.run(get_news('all', 20))
+print(news)
+
+# NHKのみから「経済」というキーワードで検索
+news = asyncio.run(get_news('nhk', 10, '経済'))
 print(news)
 ```
 
 ### cURL
 
 ```bash
-# シンプルなリクエスト
+# シンプルなリクエスト（全ソース、20件）
 curl http://localhost:8000/api/news
 
-# パラメータ付き
-curl "http://localhost:8000/api/news?source=rss&limit=20"
+# パラメータ付き（Yahoo + NHK、30件、日付降順）
+curl "http://localhost:8000/api/news?sources=yahoo,nhk&limit=30&sort_by=published_at&sort_order=desc"
+
+# キーワード検索
+curl "http://localhost:8000/api/news?sources=all&keyword=技術&limit=15"
 
 # レスポンスを整形
 curl -s http://localhost:8000/api/news | jq .
@@ -399,5 +449,5 @@ curl -i http://localhost:8000/api/news
 
 ### タイムアウト設定
 
-- Yahoo NewsへのHTTPリクエスト: 10秒
+- 各ニュースソースへのHTTPリクエスト: 10秒（`backend/config.py`の`HTTP_TIMEOUT`）
 - uvicornのデフォルトタイムアウト: 設定なし（無制限）

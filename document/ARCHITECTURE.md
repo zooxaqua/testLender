@@ -1,6 +1,6 @@
 # システムアーキテクチャ
 
-このドキュメントでは、Yahoo News Stream アプリケーションのシステム構成とアーキテクチャについて説明します。
+このドキュメントでは、News Aggregator アプリケーションのシステム構成とアーキテクチャについて説明します。
 
 ## 目次
 
@@ -23,6 +23,7 @@
 │  │              Frontend (index.html)                    │   │
 │  │  - HTML/CSS/JavaScript                               │   │
 │  │  - News Display UI                                   │   │
+│  │  - Search & Filter                                   │   │
 │  │  - Auto-refresh (2 min)                              │   │
 │  └──────────────────────────────────────────────────────┘   │
 └──────────────────┬──────────────────────────────────────────┘
@@ -36,27 +37,31 @@
 │  │  │           API Endpoints Layer                   │  │   │
 │  │  │  - GET /                                       │  │   │
 │  │  │  - GET /api/news                               │  │   │
+│  │  │  - GET /api/sources                            │  │   │
 │  │  │  - GET /health                                 │  │   │
 │  │  └────────────────────────────────────────────────┘  │   │
 │  │  ┌────────────────────────────────────────────────┐  │   │
-│  │  │           Business Logic Layer                  │  │   │
-│  │  │  - News Fetching                               │  │   │
-│  │  │  - Data Merging                                │  │   │
+│  │  │       Business Logic Layer (services)           │  │   │
+│  │  │  - NewsAggregator Service                      │  │   │
+│  │  │  - Multi-source fetching                       │  │   │
+│  │  │  - Merging & Deduplication                     │  │   │
+│  │  │  - Filtering & Sorting                         │  │   │
 │  │  │  - Cache Management                            │  │   │
 │  │  └────────────────────────────────────────────────┘  │   │
 │  │  ┌────────────────────────────────────────────────┐  │   │
-│  │  │           Data Source Layer                     │  │   │
-│  │  │  - RSS Fetcher (feedparser)                    │  │   │
-│  │  │  - Web Scraper (BeautifulSoup4)                │  │   │
+│  │  │         Data Source Layer (adapters)            │  │   │
+│  │  │  - YahooNewsAdapter (RSS + Scraping)           │  │   │
+│  │  │  - NHKNewsAdapter (RSS)                        │  │   │
+│  │  │  - GoogleNewsAdapter (RSS)                     │  │   │
 │  │  └────────────────────────────────────────────────┘  │   │
 │  └──────────────────────────────────────────────────────┘   │
-└──────────────────┬──────────────────────┬───────────────────┘
-                   │                      │
-                   ↓                      ↓
-         ┌─────────────────┐   ┌─────────────────────┐
-         │  Yahoo News RSS │   │ Yahoo News Website  │
-         │   Feed Server   │   │   (Scraping)        │
-         └─────────────────┘   └─────────────────────┘
+└──────────────────┬──────────────┬──────────────┬────────────┘
+                   │              │              │
+                   ↓              ↓              ↓
+         ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+         │ Yahoo News  │  │  NHK News   │  │ Google News │
+         │ RSS + Web   │  │     RSS     │  │     RSS     │
+         └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
 ---
@@ -96,45 +101,54 @@
 
 ### バックエンドコンポーネント
 
-```python
-# main.py の構造
-
-┌────────────────────────────────────────────────┐
-│         FastAPI Application (app)              │
-└────────────────────────────────────────────────┘
-                     │
-        ┌────────────┼────────────┐
-        ↓            ↓            ↓
-   ┌─────────┐  ┌─────────┐  ┌─────────┐
-   │ Routes  │  │ Cache   │  │ Fetchers│
-   └─────────┘  └─────────┘  └─────────┘
-        │            │            │
-        │            │            │
-   ┌─────────┐  ┌─────────┐  ┌─────────┐
-   │GET /    │  │Memory   │  │RSS      │
-   │GET /api │  │Lock     │  │Scraper  │
-   │GET /heal│  │TTL Check│  │         │
-   └─────────┘  └─────────┘  └─────────┘
+```
+backend/
+├── main.py              # FastAPIアプリケーション
+│   ├── API Endpoints
+│   └── Cache Management
+├── config.py            # 設定管理
+├── models/
+│   └── news.py          # NewsItem Pydanticモデル
+├── adapters/
+│   ├── base.py          # NewsAdapter基底クラス
+│   ├── yahoo_adapter.py # YahooNewsAdapter
+│   ├── nhk_adapter.py   # NHKNewsAdapter
+│   └── google_adapter.py # GoogleNewsAdapter
+└── services/
+    └── aggregator.py    # NewsAggregator
 ```
 
-#### 主要な関数とその役割
+#### 主要なコンポーネントとその役割
 
-| 関数/変数                | 責務                                |
+| コンポーネント          | 責務                                |
 |------------------------|-------------------------------------|
-| `app`                  | FastAPIアプリケーションインスタンス        |
-| `templates`            | Jinja2テンプレートエンジン               |
-| `_cache`               | メモリ内キャッシュストレージ              |
-| `_cache_lock`          | キャッシュアクセスの排他制御              |
-| `_fetch_rss()`         | RSSフィードからニュースを取得            |
-| `_fetch_scrape()`      | Webスクレイピングでニュースを取得         |
-| `_merge_items()`       | 複数ソースのニュースをマージ              |
-| `_fetch_news()`        | ソースに応じたニュース取得のルーティング     |
-| `_refresh_cache()`     | キャッシュの更新                       |
-| `_is_cache_fresh()`    | キャッシュの有効性チェック               |
-| `_clamp_limit()`       | リミット値のバリデーション               |
-| `root()`               | HTMLページ配信エンドポイント             |
-| `get_news()`           | ニュースAPI エンドポイント              |
-| `health()`             | ヘルスチェックエンドポイント              |
+| `main.py`              | FastAPIアプリケーション本体、エンドポイント定義、キャッシュ管理 |
+| `config.py`            | アプリケーション設定（URL、タイムアウト、TTLなど） |
+| `models/news.py`       | NewsItemデータモデル（Pydantic） |
+| `adapters/base.py`     | ニュースアダプター基底クラス |
+| `adapters/yahoo_adapter.py` | Yahoo News用アダプター（RSS + Scraping） |
+| `adapters/nhk_adapter.py`   | NHK News用アダプター（RSS） |
+| `adapters/google_adapter.py`| Google News用アダプター（RSS） |
+| `services/aggregator.py`    | 複数ソースからのニュース集約、マージ、フィルタリング |
+
+#### API Endpoints（main.py）
+
+| エンドポイント  | 責務                                |
+|---------------|-------------------------------------|
+| `GET /`       | HTMLページ配信 |
+| `GET /api/news` | ニュース取得、検索、ソート、フィルタリング |
+| `GET /api/sources` | 利用可能なソース一覧 |
+| `GET /health` | ヘルスチェック |
+
+#### NewsAggregator Service（services/aggregator.py）
+
+| メソッド                | 責務                                |
+|------------------------|-------------------------------------|
+| `fetch_from_sources()`  | 指定されたソースから並行取得 |
+| `fetch_all_sources()`   | 全ソースから並行取得 |
+| `merge_and_sort()`      | 記事のマージ、重複除去、ソート |
+| `filter_by_keyword()`   | キーワードでフィルタリング |
+| `fetch_and_aggregate()` | 上記すべてを統合した高レベルAPI |
 
 ### フロントエンドコンポーネント
 
@@ -142,13 +156,24 @@
 index.html
 ├── HTML Structure
 │   ├── Header (Title, Description)
-│   ├── Controls (Source, Limit, Refresh Button)
+│   ├── Controls
+│   │   ├── Search Input
+│   │   ├── Source Selector
+│   │   ├── Sort Controls (By/Order)
+│   │   ├── Limit Selector
+│   │   └── Refresh Button
 │   └── Grid (News Cards)
 ├── CSS Styles
 │   ├── Design System (CSS Variables)
 │   ├── Responsive Layout
-│   └── Dark Theme
+│   ├── Dark Theme
+│   └── Card Animations
 └── JavaScript Logic
+    ├── Event Handlers (search, select, click)
+    ├── API Client (fetch with parameters)
+    ├── Debounced Search (500ms)
+    ├── DOM Manipulation
+    └── Auto-refresh (2 min interval)
     ├── Event Handlers
     ├── API Client (fetch)
     └── DOM Manipulation
@@ -169,6 +194,16 @@ index.html
                                            ↓          ↓
                                     [Return Cache] [Fetch Data]
                                                       ↓
+                                              [NewsAggregator]
+                                                      ↓
+                                           [Parallel Fetch from Adapters]
+                                            ↙        ↓        ↘
+                                   [Yahoo]  [NHK]  [Google]
+                                            ↘        ↓        ↙
+                                              [Merge & Dedupe]
+                                                      ↓
+                                              [Filter & Sort]
+                                                      ↓
                                               [Update Cache]
                                                       ↓
                                               [Return Data]
@@ -179,25 +214,36 @@ index.html
 ### 詳細なニュース取得シーケンス
 
 ```
-User                Frontend            Backend              Yahoo News
-  │                    │                   │                      │
-  │  1. Click Refresh  │                   │                      │
-  ├───────────────────→│                   │                      │
-  │                    │  2. GET /api/news │                      │
-  │                    ├──────────────────→│                      │
-  │                    │                   │  3. Check Cache      │
-  │                    │                   ├─────────┐            │
-  │                    │                   │←────────┘            │
-  │                    │                   │                      │
-  │                    │                   │  4a. Cache Fresh?    │
-  │                    │                   │      ↓ NO            │
-  │                    │                   │  5. Fetch RSS        │
-  │                    │                   ├─────────────────────→│
-  │                    │                   │←─────────────────────┤
-  │                    │                   │  6. Parse Feed       │
-  │                    │                   ├─────────┐            │
-  │                    │                   │←────────┘            │
-  │                    │                   │  7. Fetch Scrape     │
+User          Frontend        Backend          Aggregator       Adapters       News Sources
+  │               │               │                │                │              │
+  │  1. Search    │               │                │                │              │
+  ├──────────────→│               │                │                │              │
+  │               │  2. GET /api/news              │                │              │
+  │               ├──────────────→│                │                │              │
+  │               │               │  3. Check Cache│                │              │
+  │               │               ├───────┐        │                │              │
+  │               │               │←──────┘        │                │              │
+  │               │               │    ↓ MISS      │                │              │
+  │               │               │  4. Fetch      │                │              │
+  │               │               ├───────────────→│                │              │
+  │               │               │                │  5. Parallel Fetch            │
+  │               │               │                ├───────────────→│              │
+  │               │               │                │                ├─────────────→│
+  │               │               │                │                │←─────────────┤
+  │               │               │                │←───────────────┤  6. Parse    │
+  │               │               │                │  7. Merge & Filter             │
+  │               │               │                ├───────┐        │              │
+  │               │               │                │←──────┘        │              │
+  │               │               │  8. Sort       │                │              │
+  │               │               │←───────────────┤                │              │
+  │               │               │  9. Cache      │                │              │
+  │               │               ├───────┐        │                │              │
+  │               │               │←──────┘        │                │              │
+  │               │  10. Response │                │                │              │
+  │               │←──────────────┤                │                │              │
+  │  11. Render   │               │                │                │              │
+  │←──────────────┤               │                │                │              │
+```
   │                    │                   ├─────────────────────→│
   │                    │                   │←─────────────────────┤
   │                    │                   │  8. Parse HTML       │
@@ -220,15 +266,25 @@ User                Frontend            Backend              Yahoo News
 
 ```python
 _cache = {
-    "rss": {
-        "items": [...],          # ニュース記事の配列
+    "yahoo,nhk:20:published_at:desc:技術": {
+        "items": [...],          # ニュース記事の配列（辞書形式）
         "fetched_at": 1708012345.67,  # UNIX timestamp
-        "limit": 10              # 取得時のlimit値
+        "limit": 20              # 取得時のlimit値
     },
-    "scrape": { ... },
-    "mixed": { ... }
+    "all:30:source:asc:": {
+        "items": [...],
+        "fetched_at": 1708012400.12,
+        "limit": 30
+    }
 }
 ```
+
+**キャッシュキー形式**: `{sources}:{limit}:{sort_by}:{sort_order}:{keyword}`
+- `sources`: ソートされたソースのカンマ区切りリスト
+- `limit`: 取得件数
+- `sort_by`: ソート基準（`published_at` or `source`）
+- `sort_order`: ソート順序（`asc` or `desc`）
+- `keyword`: 検索キーワード（空文字列の場合もある）
 
 ### キャッシュポリシー
 

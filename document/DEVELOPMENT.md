@@ -1,6 +1,6 @@
 # 開発ガイド
 
-このドキュメントは、Yahoo News Stream アプリケーションの開発に参加する開発者向けのガイドです。
+このドキュメントは、News Aggregator アプリケーションの開発に参加する開発者向けのガイドです。
 
 ## 目次
 
@@ -284,14 +284,23 @@ def _fetch_rss(limit: int):
 # ヘルスチェック
 curl http://localhost:8000/health
 
-# ニュース取得（デフォルト）
+# ニュース取得（デフォルト: 全ソース）
 curl http://localhost:8000/api/news
 
-# パラメータ指定
-curl "http://localhost:8000/api/news?source=rss&limit=5"
+# 特定ソースからの取得
+curl "http://localhost:8000/api/news?sources=yahoo,nhk&limit=10"
+
+# キーワード検索
+curl "http://localhost:8000/api/news?sources=all&keyword=技術&limit=5"
+
+# ソート指定
+curl "http://localhost:8000/api/news?sources=all&sort_by=published_at&sort_order=desc"
 
 # レスポンスを整形
 curl -s http://localhost:8000/api/news | python -m json.tool
+
+# ソース一覧を取得
+curl http://localhost:8000/api/sources
 ```
 
 #### ブラウザでのテスト
@@ -327,11 +336,17 @@ async def test_health_check():
 @pytest.mark.asyncio
 async def test_get_news():
     async with AsyncClient(app=app, base_url="http://test") as client:
-        response = await client.get("/api/news?source=rss&limit=5")
+        response = await client.get("/api/news?sources=yahoo&limit=5")
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
         assert len(data) <= 5
+        # Check response structure
+        if len(data) > 0:
+            assert "title" in data[0]
+            assert "url" in data[0]
+            assert "source" in data[0]
+            assert "source_name" in data[0]
 ```
 
 #### テスト実行
@@ -395,29 +410,38 @@ CACHE_TTL_SECONDS = 10  # 10秒に変更
 
 ---
 
-#### 4. Yahoo Newsからデータが取得できない
+#### 4. ニュースソースからデータが取得できない
 
-**問題**: 空の配列が返される
+**問題**: 空の配列が返される、または特定のソースのみ失敗する
 
 **チェック項目**:
 
 1. インターネット接続の確認
-2. Yahoo Newsのサイト構造変更の可能性
-3. タイムアウト設定の確認
+2. 各ソースのサイト構造変更の可能性（特にYahoo Newsのスクレイピング）
+3. タイムアウト設定の確認（`backend/config.py`の`HTTP_TIMEOUT`）
+4. 各ソースを個別にテスト
 
 **デバッグ**:
+```bash
+# 各ソースを個別にテスト
+curl "http://localhost:8000/api/news?sources=yahoo&limit=5"
+curl "http://localhost:8000/api/news?sources=nhk&limit=5"
+curl "http://localhost:8000/api/news?sources=google&limit=5"
+```
+
+**アダプターのデバッグ**:
 ```python
-# main.py に追加
-async def _fetch_rss(limit: int):
+# backend/adapters/yahoo_adapter.py などに追加
+async def _fetch_rss(self, limit: int):
     try:
         async with httpx.AsyncClient(...) as client:
-            response = await client.get(RSS_URL)
-            print(f"RSS Response Status: {response.status_code}")
-            print(f"RSS Response Length: {len(response.text)}")
+            response = await client.get(self.rss_url)
+            print(f"[{self.source_id}] RSS Response Status: {response.status_code}")
+            print(f"[{self.source_id}] RSS Response Length: {len(response.text)}")
             response.raise_for_status()
     except Exception as e:
-        print(f"RSS Fetch Error: {e}")
-        raise
+        print(f"[{self.source_id}] RSS Fetch Error: {e}")
+        return []  # Return empty list instead of raising
 ```
 
 ---
@@ -453,14 +477,25 @@ MAX_LIMIT = 100
 ### 並列処理の改善
 
 ```python
-# RSSとスクレイピングを並列実行
-async def _fetch_news(source: str, limit: int):
-    if source == "mixed":
-        rss_task = asyncio.create_task(_fetch_rss(limit))
-        scrape_task = asyncio.create_task(_fetch_scrape(limit))
-        rss_items, scrape_items = await asyncio.gather(rss_task, scrape_task)
-        return _merge_items(rss_items, scrape_items, limit)
-    # ...
+# 複数ソースから並列取得（既に実装済み）
+# backend/services/aggregator.py
+async def fetch_from_sources(self, sources: List[str], limit_per_source: int = 10):
+    tasks = []
+    for source_id in sources:
+        adapter = self.adapters.get(source_id)
+        if adapter:
+            tasks.append(self._fetch_with_error_handling(adapter, limit_per_source))
+    
+    # asyncio.gather で並列実行
+    results = await asyncio.gather(*tasks)
+    
+    # 結果をフラット化
+    all_items = []
+    for items in results:
+        if items:
+            all_items.extend(items)
+    
+    return all_items
 ```
 
 ### リクエストタイムアウトの調整
@@ -477,33 +512,92 @@ async with httpx.AsyncClient(timeout=5.0, ...) as client:
 
 ### 例: カテゴリーフィルター機能
 
-#### 1. バックエンドに追加
+#### 1. NewsItemモデルに追加
 
 ```python
+# backend/models/news.py
+class NewsItem(BaseModel):
+    title: str
+    url: HttpUrl
+    published_at: Optional[datetime] = None
+    source: str
+    source_name: str
+    summary: Optional[str] = None
+    image_url: Optional[HttpUrl] = None
+    category: Optional[str] = None  # 既存のフィールド
+```
+
+#### 2. アダプターでカテゴリーを抽出
+
+```python
+# backend/adapters/nhk_adapter.py など
+async def fetch_news(self, limit: int = 10):
+    # ... existing code ...
+    for entry in feed.entries[:limit]:
+        # カテゴリー情報を抽出（RSSフィードに含まれる場合）
+        category = None
+        if hasattr(entry, 'category'):
+            category = entry.category
+        
+        items.append(
+            NewsItem(
+                # ... other fields ...
+                category=category,
+            )
+        )
+```
+
+#### 3. Aggregatorにフィルターメソッドを追加
+
+```python
+# backend/services/aggregator.py
+def filter_by_category(self, items: List[NewsItem], category: str) -> List[NewsItem]:
+    if not category or category == "all":
+        return items
+    return [item for item in items if item.category == category]
+```
+
+#### 4. APIエンドポイントを更新
+
+```python
+# backend/main.py
 @app.get("/api/news")
 async def get_news(
     background_tasks: BackgroundTasks,
-    source: str = "mixed",
-    limit: int = 10,
-    category: str = "all",  # 新しいパラメータ
+    sources: Optional[str] = "all",
+    limit: int = 20,
+    sort_by: str = "published_at",
+    sort_order: str = "desc",
+    keyword: Optional[str] = None,
+    category: Optional[str] = None,  # 新しいパラメータ
 ):
-    # カテゴリーフィルターのロジックを追加
-    items = await _refresh_cache(source, limit)
+    # ... existing code ...
     
-    if category != "all":
-        items = [item for item in items if category in item.get("url", "")]
+    items = await aggregator.fetch_and_aggregate(
+        sources=source_list,
+        limit=limit,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        keyword=keyword,
+    )
     
-    return JSONResponse(items[:limit])
+    # カテゴリーフィルターを適用
+    if category:
+        items = aggregator.filter_by_category(items, category)
+    
+    return JSONResponse([item.model_dump() for item in items[:limit]])
 ```
 
-#### 2. フロントエンドに追加
+#### 5. フロントエンドに追加
 
 ```html
 <!-- index.html の controls セクションに追加 -->
 <select id="category">
-  <option value="all">All Categories</option>
-  <option value="domestic">Domestic</option>
-  <option value="world">World</option>
+  <option value="">All Categories</option>
+  <option value="domestic">国内</option>
+  <option value="world">海外</option>
+  <option value="business">経済</option>
+  <option value="technology">テクノロジー</option>
 </select>
 ```
 
@@ -511,16 +605,114 @@ async def get_news(
 // JavaScript に追加
 const categoryEl = document.getElementById("category");
 
+// loadNews関数を更新
 async function loadNews() {
-  const category = categoryEl.value;
-  const response = await fetch(
-    `/api/news?source=${source}&limit=${limit}&category=${category}`
-  );
-  // ...
+  const sources = sourceEl.value;
+  const limit = limitEl.value;
+  const sortBy = sortByEl.value;
+  const sortOrder = sortOrderEl.value;
+  const keyword = searchEl.value.trim();
+  const category = categoryEl.value;  // 追加
+  
+  statusEl.textContent = "Fetching headlines...";
+  grid.innerHTML = "";
+
+  try {
+    let url = `/api/news?sources=${sources}&limit=${limit}&sort_by=${sortBy}&sort_order=${sortOrder}`;
+    if (keyword) {
+      url += `&keyword=${encodeURIComponent(keyword)}`;
+    }
+    if (category) {
+      url += `&category=${encodeURIComponent(category)}`;  // 追加
+    }
+    
+    const response = await fetch(url);
+    // ... rest of the code ...
+  } catch (error) {
+    statusEl.textContent = "Failed to load headlines.";
+  }
 }
 
+// イベントリスナーを追加
 categoryEl.addEventListener("change", loadNews);
 ```
+
+---
+
+## ベストプラクティス
+
+### コーディング規約
+
+1. **型ヒントを必ず使用**
+   ```python
+   # Good ✓
+   async def fetch_news(limit: int) -> List[NewsItem]:
+       pass
+   
+   # Bad ✗
+   async def fetch_news(limit):
+       pass
+   ```
+
+2. **非同期関数には async/await を使用**
+   ```python
+   # Good ✓
+   async def fetch_data():
+       async with httpx.AsyncClient() as client:
+           response = await client.get(url)
+   
+   # Bad ✗
+   def fetch_data():
+       response = requests.get(url)  # blocking
+   ```
+
+3. **エラーハンドリングを適切に行う**
+   ```python
+   # Good ✓
+   try:
+       items = await adapter.fetch_news(limit)
+   except Exception as e:
+       logger.error(f"Error fetching from {adapter.source_id}: {e}")
+       return []  # Return empty instead of crashing
+   
+   # Bad ✗
+   items = await adapter.fetch_news(limit)  # May crash entire app
+   ```
+
+4. **設定値はconfig.pyに集約**
+   ```python
+   # Good ✓
+   from backend.config import settings
+   timeout = settings.HTTP_TIMEOUT
+   
+   # Bad ✗
+   timeout = 10.0  # Magic number
+   ```
+
+### テスト戦略
+
+1. **各レイヤーを個別にテスト**
+   - モデル: バリデーション
+   - アダプター: データ取得とパース
+   - サービス: ビジネスロジック
+   - API: エンドポイント
+
+2. **モックを活用**
+   ```python
+   # 実際のHTTPリクエストをモック
+   @pytest.fixture
+   def mock_http_response(monkeypatch):
+       async def mock_get(*args, **kwargs):
+           # Return mock response
+           pass
+       monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+   ```
+
+3. **エッジケースをテスト**
+   - 空のレスポンス
+   - 不正なデータ
+   - タイムアウト
+   - ネットワークエラー
 
 ---
 
