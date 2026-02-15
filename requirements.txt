@@ -1,2 +1,6 @@
 fastapi
+feedparser
+httpx
+beautifulsoup4
+jinja2
 uvicorn[standard]

@@ -1,7 +1,7 @@
 # testLender
 lenderとの連携テスト用
 
-FastAPIで最小構成のこんにちは世界を表示するサンプルです。
+FastAPIでYahooニュースの最新記事を取得し、フロントに表示するサンプルです。
 
 ## ローカル実行
 
@@ -14,7 +14,25 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-ブラウザで http://localhost:8000 を開くと、こんにちは世界が表示されます。
+ブラウザで http://localhost:8000 を開くと、最新ニュースのカードが表示されます。
+
+## 機能概要
+
+- YahooニュースのRSSを取得し、スクレイピング結果と合わせて返します。
+- `/api/news` でJSONを返します。
+- TTL付きのメモリキャッシュで取得頻度を抑えています。
+
+### API
+
+`GET /api/news?source=mixed&limit=12`
+
+- `source`: `mixed` | `rss` | `scrape`
+- `limit`: 1-50
+
+## 注意事項
+
+- Yahooの利用規約に従って運用してください。
+- スクレイピングは頻度を抑えるため、キャッシュを必ず使っています。
 
 ## Render設定
 
