@@ -3,29 +3,41 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
-import feedparser
-import httpx
-from bs4 import BeautifulSoup
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from urllib.parse import urljoin
+
+from backend.adapters import YahooNewsAdapter, NHKNewsAdapter, GoogleNewsAdapter
+from backend.config import settings
+from backend.models import NewsItem
+from backend.services import NewsAggregator
 
 # このファイルの場所を基準にテンプレートディレクトリを解決
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = BASE_DIR.parent / "frontend"
 
-app = FastAPI()
+app = FastAPI(title="News Aggregator API", version="2.0.0")
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 
-RSS_URL = "https://news.yahoo.co.jp/rss/topics/top-picks.xml"
-SCRAPE_URL = "https://news.yahoo.co.jp/"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+# Initialize adapters
+yahoo_adapter = YahooNewsAdapter()
+nhk_adapter = NHKNewsAdapter()
+google_adapter = GoogleNewsAdapter()
 
-CACHE_TTL_SECONDS = 300
-MAX_LIMIT = 50
+# Initialize aggregator with all adapters
+aggregator = NewsAggregator(
+    adapters={
+        "yahoo": yahoo_adapter,
+        "nhk": nhk_adapter,
+        "google": google_adapter,
+    }
+)
+
+# Cache configuration
+CACHE_TTL_SECONDS = settings.CACHE_TTL_SECONDS
+MAX_LIMIT = settings.MAX_LIMIT
 
 _cache: dict[str, dict[str, Any]] = {}
 _cache_lock = asyncio.Lock()
@@ -35,8 +47,17 @@ def _now() -> float:
     return time.time()
 
 
-def _is_cache_fresh(source: str, limit: int) -> bool:
-    entry = _cache.get(source)
+def _is_cache_fresh(cache_key: str, limit: int) -> bool:
+    """Check if cache is fresh for a given key.
+
+    Args:
+        cache_key: Cache key.
+        limit: Required limit.
+
+    Returns:
+        True if cache is fresh and sufficient.
+    """
+    entry = _cache.get(cache_key)
     if not entry:
         return False
     if _now() - entry["fetched_at"] >= CACHE_TTL_SECONDS:
@@ -51,97 +72,109 @@ def _clamp_limit(limit: int) -> int:
     return min(limit, MAX_LIMIT)
 
 
-async def _fetch_rss(limit: int) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": USER_AGENT}) as client:
-        response = await client.get(RSS_URL)
-        response.raise_for_status()
+def _news_items_to_dict(items: List[NewsItem]) -> List[Dict[str, Any]]:
+    """Convert NewsItem objects to dictionary format for API response.
 
-    feed = feedparser.parse(response.text)
-    items: list[dict[str, Any]] = []
-    for entry in feed.entries[:limit]:
-        items.append(
+    Args:
+        items: List of NewsItem objects.
+
+    Returns:
+        List of dictionaries compatible with existing frontend.
+    """
+    result = []
+    for item in items:
+        result.append(
             {
-                "title": entry.get("title", ""),
-                "url": entry.get("link", ""),
-                "published_at": entry.get("published") or entry.get("updated"),
-                "source": "rss",
+                "title": item.title,
+                "url": str(item.url),
+                "published_at": item.published_at.isoformat() if item.published_at else None,
+                "source": item.source,
+                "source_name": item.source_name,
+                "summary": item.summary,
             }
         )
-    return items
+    return result
 
 
-async def _fetch_scrape(limit: int) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": USER_AGENT}) as client:
-        response = await client.get(SCRAPE_URL)
-        response.raise_for_status()
+async def _fetch_news(
+    sources: List[str],
+    limit: int,
+    sort_by: str = "published_at",
+    sort_order: str = "desc",
+    keyword: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch news using the aggregator or specific adapter.
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    items: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    Args:
+        sources: List of source identifiers.
+        limit: Maximum number of items to return.
+        sort_by: Sort field ('published_at' or 'source').
+        sort_order: Sort order ('asc' or 'desc').
+        keyword: Optional keyword to filter by title.
 
-    for anchor in soup.select("a[href]"):
-        href = anchor.get("href")
-        if not href:
-            continue
-        if "news.yahoo.co.jp/articles/" not in href and not href.startswith("/articles/"):
-            continue
+    Returns:
+        List of news items as dictionaries.
+    """
+    # Handle legacy Yahoo-specific modes
+    if "rss" in sources:
+        items = await yahoo_adapter.fetch_rss_only(limit)
+        return _news_items_to_dict(items)
+    elif "scrape" in sources:
+        items = await yahoo_adapter.fetch_scrape_only(limit)
+        return _news_items_to_dict(items)
+    elif "mixed" in sources:
+        items = await yahoo_adapter.fetch_news(limit)
+        return _news_items_to_dict(items)
 
-        title = " ".join(anchor.get_text(strip=True).split())
-        if not title:
-            continue
-
-        url = urljoin(SCRAPE_URL, href)
-        if url in seen:
-            continue
-
-        seen.add(url)
-        items.append(
-            {
-                "title": title,
-                "url": url,
-                "published_at": None,
-                "source": "scrape",
-            }
+    # Handle new multi-source aggregation
+    if "all" in sources:
+        # Fetch from all sources
+        items = await aggregator.fetch_and_aggregate(
+            limit=limit, sort_by=sort_by, sort_order=sort_order, keyword=keyword
         )
-        if len(items) >= limit:
-            break
+    else:
+        # Validate and filter sources
+        valid_sources = [s for s in sources if s in aggregator.adapters]
+        if not valid_sources:
+            valid_sources = ["yahoo"]  # Default fallback
+        items = await aggregator.fetch_and_aggregate(
+            sources=valid_sources,
+            limit=limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            keyword=keyword,
+        )
 
-    return items
-
-
-def _merge_items(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for item in primary + secondary:
-        url = item.get("url")
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        merged.append(item)
-        if len(merged) >= limit:
-            break
-    return merged
+    return _news_items_to_dict(items)
 
 
-async def _fetch_news(source: str, limit: int) -> list[dict[str, Any]]:
-    if source == "rss":
-        return await _fetch_rss(limit)
-    if source == "scrape":
-        return await _fetch_scrape(limit)
+async def _refresh_cache(
+    cache_key: str,
+    sources: List[str],
+    limit: int,
+    sort_by: str = "published_at",
+    sort_order: str = "desc",
+    keyword: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Refresh the cache for given sources.
 
-    rss_items = await _fetch_rss(limit)
-    scrape_items = await _fetch_scrape(limit)
-    return _merge_items(rss_items, scrape_items, limit)
+    Args:
+        cache_key: Cache key.
+        sources: List of source identifiers.
+        limit: Number of items to fetch.
+        sort_by: Sort field.
+        sort_order: Sort order.
+        keyword: Optional keyword filter.
 
-
-async def _refresh_cache(source: str, limit: int) -> list[dict[str, Any]]:
+    Returns:
+        List of news items.
+    """
     async with _cache_lock:
-        if _is_cache_fresh(source, limit):
-            return _cache[source]["items"]
+        if _is_cache_fresh(cache_key, limit):
+            return _cache[cache_key]["items"]
 
-        items = await _fetch_news(source, limit)
-        _cache[source] = {
+        items = await _fetch_news(sources, limit, sort_by, sort_order, keyword)
+        _cache[cache_key] = {
             "items": items,
             "fetched_at": _now(),
             "limit": limit,
@@ -149,8 +182,16 @@ async def _refresh_cache(source: str, limit: int) -> list[dict[str, Any]]:
         return items
 
 
-def _get_cached_items(source: str) -> list[dict[str, Any]] | None:
-    entry = _cache.get(source)
+def _get_cached_items(cache_key: str) -> List[Dict[str, Any]] | None:
+    """Get cached items for a cache key.
+
+    Args:
+        cache_key: Cache key.
+
+    Returns:
+        Cached items or None if not available.
+    """
+    entry = _cache.get(cache_key)
     if not entry:
         return None
     return entry.get("items")
@@ -164,27 +205,96 @@ async def root(request: Request) -> HTMLResponse:
 @app.get("/api/news")
 async def get_news(
     background_tasks: BackgroundTasks,
-    source: str = "mixed",
-    limit: int = 10,
+    sources: Optional[str] = Query(
+        default="all",
+        description="Comma-separated list of sources (yahoo,nhk,google) or 'all'",
+    ),
+    limit: int = Query(default=20, ge=1, le=MAX_LIMIT),
+    sort_by: str = Query(
+        default="published_at",
+        description="Sort field: 'published_at' or 'source'",
+    ),
+    sort_order: str = Query(
+        default="desc", description="Sort order: 'asc' or 'desc'"
+    ),
+    keyword: Optional[str] = Query(
+        default=None, description="Filter by keyword in title"
+    ),
 ) -> JSONResponse:
-    source = source.lower().strip()
-    if source not in {"rss", "scrape", "mixed"}:
-        source = "mixed"
+    """Get news from specified sources with filtering and sorting.
 
-    limit = _clamp_limit(limit)
-    cached_items = _get_cached_items(source)
+    Args:
+        background_tasks: FastAPI background tasks.
+        sources: Comma-separated source list or special values.
+        limit: Maximum number of items to return.
+        sort_by: Sort field ('published_at' or 'source').
+        sort_order: Sort order ('asc' or 'desc').
+        keyword: Optional keyword to filter by title.
 
-    if cached_items and _is_cache_fresh(source, limit):
+    Returns:
+        JSON response with news items.
+    """
+    # Validate sort parameters
+    if sort_by not in ["published_at", "source"]:
+        sort_by = "published_at"
+    if sort_order not in ["asc", "desc"]:
+        sort_order = "desc"
+
+    # Parse sources
+    source_list = [s.strip().lower() for s in sources.split(",") if s.strip()]
+    if not source_list:
+        source_list = ["all"]
+
+    # Create cache key from parameters
+    cache_key = (
+        f"{','.join(sorted(source_list))}:{limit}:{sort_by}:{sort_order}"
+        f":{keyword or ''}"
+    )
+
+    # Check cache
+    cached_items = _get_cached_items(cache_key)
+
+    if cached_items and _is_cache_fresh(cache_key, limit):
         return JSONResponse(cached_items[:limit])
 
     if cached_items and len(cached_items) >= limit:
-        background_tasks.add_task(_refresh_cache, source, limit)
+        # Return cached data and refresh in background
+        background_tasks.add_task(
+            _refresh_cache, cache_key, source_list, limit, sort_by, sort_order, keyword
+        )
         return JSONResponse(cached_items[:limit])
 
-    items = await _refresh_cache(source, limit)
+    # Fetch new data
+    items = await _refresh_cache(
+        cache_key, source_list, limit, sort_by, sort_order, keyword
+    )
     return JSONResponse(items[:limit])
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/sources")
+def get_sources() -> JSONResponse:
+    """Get available news sources.
+
+    Returns:
+        JSON response with list of available sources.
+    """
+    sources = []
+    for source_id, adapter in aggregator.adapters.items():
+        sources.append(
+            {
+                "id": source_id,
+                "name": adapter.source_name,
+                "enabled": source_id in settings.ENABLED_SOURCES,
+            }
+        )
+    return JSONResponse(
+        {
+            "sources": sources,
+            "default": settings.DEFAULT_SOURCE,
+        }
+    )

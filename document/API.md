@@ -1,6 +1,6 @@
 # API仕様書
 
-このドキュメントでは、Yahoo News Stream アプリケーションのAPI仕様について詳細に説明します。
+このドキュメントでは、News Aggregator アプリケーションのAPI仕様について詳細に説明します。
 
 ## ベースURL
 
@@ -29,7 +29,7 @@ curl http://localhost:8000/
 
 **説明**:
 - フロントエンドの`index.html`を返します
-- UIからニュースの閲覧と設定変更が可能です
+- UIからニュースの閲覧、検索、フィルタリング、ソートが可能です
 
 ---
 
@@ -37,35 +37,46 @@ curl http://localhost:8000/
 
 #### `GET /api/news`
 
-ニュースの一覧をJSON形式で返します。
+ニュースの一覧をJSON形式で返します。検索、フィルタリング、ソート機能をサポートします。
 
 **クエリパラメータ**:
 
-| パラメータ | 型     | 必須 | デフォルト | 制約       | 説明                                      |
-|---------|--------|------|---------|-----------|------------------------------------------|
-| source  | string | No   | mixed   | 特定値のみ  | `rss`, `scrape`, `mixed`のいずれか         |
-| limit   | int    | No   | 10      | 1〜50     | 取得するニュースの最大件数                    |
+| パラメータ | 型     | 必須 | デフォルト      | 制約                | 説明                                           |
+|---------|--------|------|----------------|---------------------|-----------------------------------------------|
+| sources | string | No   | all            | 特定値またはカンマ区切り| `all`, `yahoo`, `nhk`, `google` または組み合わせ  |
+| limit   | int    | No   | 20             | 1〜50              | 取得するニュースの最大件数                        |
+| sort_by | string | No   | published_at   | `published_at`, `source` | ソートフィールド                               |
+| sort_order | string | No | desc          | `asc`, `desc`       | ソート順（昇順/降順）                           |
+| keyword | string | No   | -              | -                   | タイトルでフィルタリングするキーワード              |
 
-**sourceパラメータの詳細**:
+**sourcesパラメータの詳細**:
 
-- `rss`: Yahoo NewsのRSSフィードからのみ取得
-- `scrape`: Webスクレイピングでトップページから取得
-- `mixed`: RSSとスクレイピングの両方から取得してマージ（デフォルト）
+- `all`: 全ソースから取得（Yahoo, NHK, Google）
+- `yahoo`: Yahoo Newsのみ
+- `nhk`: NHK Newsのみ
+- `google`: Google Newsのみ
+- `yahoo,nhk`: 複数ソースの組み合わせ（カンマ区切り）
+- `mixed`: Yahoo混合モード（RSS + スクレイピング、レガシー）
+- `rss`: Yahoo RSSのみ（レガシー）
+- `scrape`: Yahooスクレイピングのみ（レガシー）
 
 **リクエスト例**:
 
 ```bash
-# デフォルト設定（mixed, 10件）
+# デフォルト設定（全ソース、20件）
 curl http://localhost:8000/api/news
 
-# RSSのみ、20件
-curl http://localhost:8000/api/news?source=rss&limit=20
+# Yahoo + NHK、日付降順、30件
+curl "http://localhost:8000/api/news?sources=yahoo,nhk&limit=30&sort_by=published_at&sort_order=desc"
 
-# スクレイプのみ、12件
-curl http://localhost:8000/api/news?source=scrape&limit=12
+# キーワード「技術」で検索
+curl "http://localhost:8000/api/news?keyword=技術&limit=10"
 
-# ミックス、50件（最大）
-curl http://localhost:8000/api/news?source=mixed&limit=50
+# ソース順でソート
+curl "http://localhost:8000/api/news?sort_by=source&sort_order=asc"
+
+# Google Newsのみ、最古から5件
+curl "http://localhost:8000/api/news?sources=google&limit=5&sort_order=asc"
 ```
 
 **レスポンス**:
@@ -78,14 +89,18 @@ curl http://localhost:8000/api/news?source=mixed&limit=50
   {
     "title": "ニュース記事のタイトル",
     "url": "https://news.yahoo.co.jp/articles/xxxxx",
-    "published_at": "Wed, 15 Feb 2026 12:34:56 +0900",
-    "source": "rss"
+    "published_at": "2026-02-15T12:34:56",
+    "source": "yahoo",
+    "source_name": "Yahoo News",
+    "summary": "記事の要約文（利用可能な場合）"
   },
   {
     "title": "別のニュース記事",
-    "url": "https://news.yahoo.co.jp/articles/yyyyy",
-    "published_at": null,
-    "source": "scrape"
+    "url": "https://www3.nhk.or.jp/news/xxxxx",
+    "published_at": "2026-02-15T11:20:00",
+    "source": "nhk",
+    "source_name": "NHK News",
+    "summary": "NHKニュースの要約"
   }
 ]
 ```
@@ -96,8 +111,64 @@ curl http://localhost:8000/api/news?source=mixed&limit=50
 |--------------|-------------------|-------------------------------------------|
 | title        | string            | 記事のタイトル                                |
 | url          | string            | 記事へのURL                                  |
-| published_at | string \| null    | 公開日時（RFC 822形式、スクレイピング時はnull）     |
-| source       | string            | データソース（`rss` または `scrape`）           |
+| published_at | string \| null    | 公開日時（ISO 8601形式）                      |
+| source       | string            | データソース識別子（`yahoo`, `nhk`, `google`） |
+| source_name  | string            | データソースの表示名                           |
+| summary      | string \| null    | 記事の要約（利用可能な場合）                    |
+
+---
+
+### 3. ソース一覧API
+
+#### `GET /api/sources`
+
+利用可能なニュースソースの一覧を返します。
+
+**リクエスト例**:
+```bash
+curl http://localhost:8000/api/sources
+```
+
+**レスポンス**:
+
+```json
+{
+  "sources": [
+    {
+      "id": "yahoo",
+      "name": "Yahoo News",
+      "enabled": true
+    },
+    {
+      "id": "nhk",
+      "name": "NHK News",
+      "enabled": true
+    },
+    {
+      "id": "google",
+      "name": "Google News",
+      "enabled": true
+    }
+  ],
+  "default": "all"
+}
+```
+
+**レスポンスフィールド**:
+
+| フィールド | 型      | 説明                        |
+|----------|---------|----------------------------|
+| sources  | array   | ソース情報の配列              |
+| sources[].id | string | ソース識別子            |
+| sources[].name | string | ソース表示名          |
+| sources[].enabled | boolean | ソースが有効かどうか |
+| default  | string  | デフォルトソース              |
+
+---
+
+### 4. ヘルスチェックAPI
+
+#### `GET /health`
 
 **エラーレスポンス**:
 

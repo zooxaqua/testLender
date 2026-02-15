@@ -1,6 +1,6 @@
-# Yahoo News Stream アプリケーション
+# News Aggregator アプリケーション
 
-Yahoo NewsのRSSフィードとスクレイピングを組み合わせて、最新ニュースのヘッドラインを表示するWebアプリケーションです。
+複数のニュースソースから最新ニュースを取得・統合し、検索・フィルタリング・ソート機能を備えたWebアプリケーションです。
 
 ## 📋 目次
 
@@ -10,19 +10,29 @@ Yahoo NewsのRSSフィードとスクレイピングを組み合わせて、最�
 - [技術スタック](#技術スタック)
 - [セットアップ](#セットアップ)
 - [API仕様](#api仕様)
+- [テスト](#テスト)
 - [デプロイ](#デプロイ)
-- [注意事項](#注意事項)
 
 ---
 
 ## 概要
 
-このアプリケーションは、Yahoo Newsから最新のヘッドラインを取得してWebページに表示します。データソースとして以下の2つの方法をサポートしています：
+このアプリケーションは、複数のニュースソースから最新のヘッドラインを取得して統合表示します。
 
-1. **RSSフィード** - Yahoo NewsのRSSから記事情報を取得
-2. **Webスクレイピング** - Yahoo Newsのトップページから記事リンクを抽出
+### 対応ニュースソース
 
-取得したニュースはメモリ内にキャッシュされ、過度なアクセスを防ぎます。
+1. **Yahoo News** - RSSフィード + Webスクレイピング
+2. **NHK News** - 公式RSSフィード
+3. **Google News** - Googleニュース日本版RSS
+
+### 主な特徴
+
+- 複数ソースからの並行取得・統合
+- リアルタイム検索機能
+- 柔軟なソート機能（日付順/ソース順）
+- 重複記事の自動除去
+- レスポンシブUI
+- メモリキャッシュによる高速化
 
 ---
 
@@ -31,60 +41,70 @@ Yahoo NewsのRSSフィードとスクレイピングを組み合わせて、最�
 ```
 testLender/
 ├── backend/              # バックエンドアプリケーション
-│   ├── main.py          # FastAPI アプリケーション本体
-│   ├── requirements.txt # Python依存パッケージ
-│   └── runtime.txt      # Pythonバージョン指定
+│   ├── adapters/        # ニュースソースアダプター
+│   │   ├── base.py     # 基底アダプタークラス
+│   │   ├── yahoo_adapter.py
+│   │   ├── nhk_adapter.py
+│   │   └── google_adapter.py
+│   ├── models/          # データモデル
+│   │   └── news.py     # NewsItem クラス  
+│   ├── services/        # ビジネスロジック
+│   │   └── aggregator.py # ニュース集約サービス
+│   ├── config.py        # 設定管理
+│   ├── main.py          # FastAPI アプリケーション
+│   ├── requirements.txt # 本番依存パッケージ
+│   └── requirements-test.txt # テスト依存パッケージ
 ├── frontend/             # フロントエンドファイル
-│   └── index.html       # メインHTMLページ（CSS/JavaScript含む）
+│   └── index.html       # SPA（検索・フィルター機能付き）
+├── tests/                # テストコード
+│   ├── conftest.py
+│   ├── test_models.py
+│   ├── test_adapters.py
+│   ├── test_aggregator.py
+│   └── test_api.py
 ├── document/             # ドキュメント
-│   └── README.md        # このファイル
+│   ├── README.md        # このファイル
+│   ├── API.md           # API仕様書
+│   ├── ARCHITECTURE.md  # アーキテクチャ
+│   └── DEVELOPMENT.md   # 開発ガイド
 └── render.yaml          # Renderデプロイ設定
 
 ```
-
-### バックエンド (`backend/`)
-
-FastAPIを使用したRESTful APIサーバー
-
-- **main.py** - アプリケーションロジック
-  - RSSフィード取得
-  - Webスクレイピング
-  - キャッシング機構
-  - API エンドポイント定義
-
-### フロントエンド (`frontend/`)
-
-シングルページアプリケーション（SPA）
-
-- **index.html** - UI、スタイリング、JavaScriptロジックを含む完全なページ
 
 ---
 
 ## 主要機能
 
-### 1. ニュース取得
+### 1. マルチソース対応
 
-- **RSSモード**: Yahoo NewsのRSSフィードからニュースを取得
-- **スクレイプモード**: Yahoo Newsトップページから記事リンクを抽出
-- **ミックスモード**: 両方のソースから取得してマージ
+- 3つのニュースソースから並行取得
+- ソース別・組み合わせでの取得が可能
+- エラーハンドリング（一部失敗時も継続）
 
-### 2. キャッシング
+### 2. 検索・フィルタリング
+
+- タイトルによるキーワード検索
+- 大文字小文字を区別しない検索
+- リアルタイム検索（入力後0.5秒でトリガー）
+
+### 3. ソート機能
+
+- 日付順（新しい順/古い順）
+- ソース順（アルファベット順）
+
+### 4. キャッシング
 
 - TTL（Time To Live）: 300秒（5分）
-- ソース別にキャッシュを管理
-- キャッシュ有効時はバックグラウンドで更新
+- ソース・パラメータ別にキャッシュ管理
+- バックグラウンド更新対応
 
-### 3. レスポンシブUI
+### 5. レスポンシブUI
 
-- カードベースのレイアウト
-- ダークモードデザイン
+- カードベースのモダンなデザイン
+- ダークモードテーマ
 - モバイル対応
-
-### 4. 設定可能なオプション
-
-- データソース選択（RSS / Scrape / Mixed）
-- 表示件数制限（1〜50件）
-- 手動リフレッシュ機能
+- ソースバッジ表示
+- サマリー表示（利用可能な場合）
 
 ---
 
@@ -92,12 +112,113 @@ FastAPIを使用したRESTful APIサーバー
 
 ### バックエンド
 
-- **FastAPI** - Webフレームワーク
+- **FastAPI** - 高速Webフレームワーク
+- **Pydantic** - データバリデーション
 - **httpx** - 非同期HTTPクライアント
 - **feedparser** - RSSフィード解析
 - **BeautifulSoup4** - HTMLパーサー
-- **Jinja2** - テンプレートエンジン
 - **uvicorn** - ASGIサーバー
+
+### テスト
+
+- **pytest** - テストフレームワーク
+- **pytest-asyncio** - 非同期テストサポート
+- **pytest-cov** - カバレッジ測定
+
+### フロントエンド
+
+- Vanilla JavaScript（フレームワークなし）
+- CSS Grid レイアウト
+- Fetch API
+
+---
+
+## セットアップ
+
+### 必要条件
+
+- Python 3.11以上
+- pip
+
+### インストール
+
+```bash
+# リポジトリのクローン
+git clone https://github.com/zooxaqua/testLender.git
+cd testLender
+
+# 依存パッケージのインストール
+pip install -r backend/requirements.txt
+
+# テスト用パッケージのインストール（オプション）
+pip install -r backend/requirements-test.txt
+```
+
+### 起動
+
+```bash
+# 開発サーバー起動
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+# ブラウザで開く
+open http://localhost:8000
+```
+
+---
+
+## API仕様
+
+詳細は[API.md](API.md)を参照してください。
+
+### 主要エンドポイント
+
+```bash
+# ニュース取得（全ソース）
+GET /api/news?sources=all&limit=20
+
+# キーワード検索
+GET /api/news?keyword=技術&limit=10
+
+# ソート指定
+GET /api/news?sort_by=published_at&sort_order=desc
+
+# ソース一覧
+GET /api/sources
+
+# ヘルスチェック
+GET /health
+```
+
+---
+
+## テスト
+
+### テスト実行
+
+```bash
+# 全テスト実行
+pytest
+
+# カバレッジレポート付き
+pytest --cov=backend --cov-report=html
+
+# 特定のテストファイル
+pytest tests/test_models.py
+
+# 詳細出力
+pytest -v
+```
+
+### テストカバレッジ
+
+- データモデル（NewsItem）
+- アダプター（Yahoo, NHK, Google）
+- アグリゲーターサービス
+- APIエンドポイント
+
+---
+
+## デプロイ
 
 ### フロントエンド
 
