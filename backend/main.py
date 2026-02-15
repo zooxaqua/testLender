@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from urllib.parse import urljoin
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory="../frontend")
 
 RSS_URL = "https://news.yahoo.co.jp/rss/topics/top-picks.xml"
 SCRAPE_URL = "https://news.yahoo.co.jp/"
