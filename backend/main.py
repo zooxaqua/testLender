@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
 import feedparser
@@ -12,8 +13,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from urllib.parse import urljoin
 
+# このファイルの場所を基準にテンプレートディレクトリを解決
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_DIR = BASE_DIR.parent / "frontend"
+
 app = FastAPI()
-templates = Jinja2Templates(directory="../frontend")
+templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 
 RSS_URL = "https://news.yahoo.co.jp/rss/topics/top-picks.xml"
 SCRAPE_URL = "https://news.yahoo.co.jp/"
